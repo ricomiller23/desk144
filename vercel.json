@@ -1,0 +1,5 @@
+{
+  "functions": {
+    "app/api/pull/route.ts": { "maxDuration": 60 }
+  }
+}

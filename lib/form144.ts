@@ -1,0 +1,177 @@
+import { XMLParser } from "fast-xml-parser";
+
+// SEC fair-access requires a descriptive User-Agent with contact info.
+// Override in Vercel env: SEC_USER_AGENT="YourFirm Name you@email.com"
+const UA =
+  process.env.SEC_USER_AGENT ||
+  "desk144 restricted-securities sourcing (set SEC_USER_AGENT env)";
+const SEC_HEADERS = { "User-Agent": UA, "Accept-Encoding": "gzip, deflate" };
+
+const LISTED = ["NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "CBOE"];
+const HIGH_VALUE_BASIS = [
+  "conversion", "convert", "note", "debenture",
+  "settlement", "private placement", "exchange", "pipe",
+];
+const CONTROL_WORDS = [
+  "affiliate", "officer", "director", "10%",
+  "ceo", "chairman", "president", "founder",
+];
+
+export interface Target {
+  issuer: string;
+  issuerCik: string;
+  seller: string;
+  relationship: string;
+  exchange: string;
+  isOtc: boolean;
+  sharesToSell: number;
+  sharesOutstanding: number;
+  slicePct: number | null;
+  aggregateMktValue: number;
+  acquisitionBasis: string;
+  highValueBasis: boolean;
+  isControl: boolean;
+  broker: string;
+  approxSaleDate: string;
+  score: number;
+  accession: string;
+}
+
+const parser = new XMLParser({
+  ignoreAttributes: true,
+  removeNSPrefix: true,
+  parseTagValue: false,
+  trimValues: true,
+});
+
+function pad(n: number) {
+  return String(n).padStart(2, "0");
+}
+function ymd(d: Date) {
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
+}
+function quarter(d: Date) {
+  return Math.floor(d.getUTCMonth() / 3) + 1;
+}
+function asArray<T>(x: T | T[] | undefined | null): T[] {
+  if (x == null) return [];
+  return Array.isArray(x) ? x : [x];
+}
+function num(x: unknown): number {
+  const n = parseFloat(String(x ?? "").replace(/,/g, ""));
+  return Number.isNaN(n) ? 0 : n;
+}
+
+/** Pull the pipe-delimited daily master index and return Form 144 / 144A filings. */
+export async function listFilings(
+  d: Date
+): Promise<{ cik: string; accession: string }[]> {
+  const url = `https://www.sec.gov/Archives/edgar/daily-index/${d.getUTCFullYear()}/QTR${quarter(
+    d
+  )}/master.${ymd(d)}.idx`;
+  const res = await fetch(url, { headers: SEC_HEADERS, cache: "no-store" });
+  if (res.status === 404) return []; // weekend / holiday / future date
+  if (!res.ok) throw new Error(`daily-index ${res.status}`);
+  const text = await res.text();
+  const out: { cik: string; accession: string }[] = [];
+  for (const line of text.split("\n")) {
+    const parts = line.split("|");
+    if (parts.length !== 5) continue;
+    const form = parts[2];
+    if (form === "144" || form === "144/A") {
+      const accession = parts[4]
+        .trim()
+        .split("/")
+        .pop()!
+        .replace(".txt", "")
+        .replace(/-/g, "");
+      out.push({ cik: parts[0].trim(), accession });
+    }
+  }
+  return out;
+}
+
+/** Fetch one filing's structured primary_doc.xml and return its formData node. */
+export async function fetch144(cik: string, accession: string): Promise<any> {
+  const url = `https://www.sec.gov/Archives/edgar/data/${cik}/${accession}/primary_doc.xml`;
+  const res = await fetch(url, { headers: SEC_HEADERS, cache: "no-store" });
+  if (!res.ok) return null;
+  const xml = await res.text();
+  try {
+    return parser.parse(xml)?.edgarSubmission?.formData ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Flatten + score one filing. All inputs come from the filing itself. */
+export function evaluate(fd: any, accession: string): Target {
+  const issuer = fd?.issuerInfo ?? {};
+  const si = asArray<any>(fd?.securitiesInformation)[0] ?? {};
+  const stb = asArray<any>(fd?.securitiesToBeSold);
+
+  const exch = String(si.securitiesExchangeName ?? "").toUpperCase();
+  const isOtc = !LISTED.some((x) => exch.includes(x)); // blank or "OTC" -> true
+
+  const rel = String(issuer.relationshipsToIssuer ?? "").toLowerCase();
+  const isControl = CONTROL_WORDS.some((w) => rel.includes(w));
+
+  const toSell = num(si.numberOfUnitsToBeSold);
+  const outstanding = num(si.noOfUnitsOutstanding);
+  const amv = num(si.aggregateMarketValue);
+  const slicePct = outstanding ? (toSell / outstanding) * 100 : null;
+
+  const basisText = stb
+    .map((b) => `${b?.natureOfAcquisitionTransaction ?? ""} ${b?.natureOfPayment ?? ""}`)
+    .join(" ")
+    .toLowerCase()
+    .trim();
+  const highValueBasis = HIGH_VALUE_BASIS.some((k) => basisText.includes(k));
+
+  let score = 0;
+  if (isOtc) score += 50; // primary gate
+  if (highValueBasis) score += 25; // debt / convert / PIPE holder
+  if (isControl) score += 15; // permanent volume cap
+  if (slicePct != null && slicePct < 1) score += 10; // forced to dribble
+  score += Math.min(amv / 100_000, 20); // size, capped
+
+  return {
+    issuer: String(issuer.issuerName ?? ""),
+    issuerCik: String(issuer.issuerCik ?? ""),
+    seller: String(issuer.nameOfPersonForWhoseAccountTheSecuritiesAreToBeSold ?? ""),
+    relationship: String(issuer.relationshipsToIssuer ?? ""),
+    exchange: String(si.securitiesExchangeName ?? ""),
+    isOtc,
+    sharesToSell: toSell,
+    sharesOutstanding: outstanding,
+    slicePct: slicePct != null ? +slicePct.toFixed(4) : null,
+    aggregateMktValue: amv,
+    acquisitionBasis: basisText,
+    highValueBasis,
+    isControl,
+    broker: String(asArray<any>(si.brokerOrMarketMakerDetails)[0]?.name ?? ""),
+    approxSaleDate: String(si.approxSaleDate ?? ""),
+    score: +score.toFixed(1),
+    accession,
+  };
+}
+
+/** Bounded-concurrency map, to respect SEC's ~10 req/sec ceiling. */
+export async function mapPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (t: T) => Promise<R>
+): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let i = 0;
+  async function worker() {
+    while (i < items.length) {
+      const idx = i++;
+      out[idx] = await fn(items[idx]);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, worker)
+  );
+  return out;
+}
