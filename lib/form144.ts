@@ -44,6 +44,34 @@ const parser = new XMLParser({
   trimValues: true,
 });
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// ---- global rate gate: space SEC requests ~120ms apart (~8/sec, under 10/sec ceiling) ----
+const MIN_INTERVAL = 120;
+let gate: Promise<void> = Promise.resolve();
+async function rateGate(): Promise<void> {
+  const prev = gate;
+  let release!: () => void;
+  gate = new Promise<void>((r) => (release = r));
+  await prev;
+  setTimeout(release, MIN_INTERVAL);
+}
+
+// ---- fetch with throttle + exponential backoff on 429/403/503 ----
+async function secFetch(url: string, tries = 4): Promise<Response> {
+  let last: Response | null = null;
+  for (let attempt = 0; attempt < tries; attempt++) {
+    await rateGate();
+    const res = await fetch(url, { headers: SEC_HEADERS, cache: "no-store" });
+    if (res.status !== 429 && res.status !== 403 && res.status !== 503) return res;
+    last = res;
+    const ra = Number(res.headers.get("retry-after"));
+    const waitMs = ra ? ra * 1000 : Math.min(8000, 600 * 2 ** attempt);
+    if (attempt < tries - 1) await sleep(waitMs);
+  }
+  return last as Response; // exhausted retries; caller handles the status
+}
+
 function pad(n: number) {
   return String(n).padStart(2, "0");
 }
@@ -69,8 +97,12 @@ export async function listFilings(
   const url = `https://www.sec.gov/Archives/edgar/daily-index/${d.getUTCFullYear()}/QTR${quarter(
     d
   )}/master.${ymd(d)}.idx`;
-  const res = await fetch(url, { headers: SEC_HEADERS, cache: "no-store" });
+  const res = await secFetch(url);
   if (res.status === 404) return []; // weekend / holiday / future date
+  if (res.status === 429 || res.status === 403)
+    throw new Error(
+      `SEC rate-limited (${res.status}) — wait a few minutes, lower Max filings/day, and confirm SEC_USER_AGENT is set`
+    );
   if (!res.ok) throw new Error(`daily-index ${res.status}`);
   const text = await res.text();
   const out: { cik: string; accession: string }[] = [];
@@ -94,7 +126,7 @@ export async function listFilings(
 /** Fetch one filing's structured primary_doc.xml and return its formData node. */
 export async function fetch144(cik: string, accession: string): Promise<any> {
   const url = `https://www.sec.gov/Archives/edgar/data/${cik}/${accession}/primary_doc.xml`;
-  const res = await fetch(url, { headers: SEC_HEADERS, cache: "no-store" });
+  const res = await secFetch(url);
   if (!res.ok) return null;
   const xml = await res.text();
   try {
@@ -111,7 +143,7 @@ export function evaluate(fd: any, accession: string): Target {
   const stb = asArray<any>(fd?.securitiesToBeSold);
 
   const exch = String(si.securitiesExchangeName ?? "").toUpperCase();
-  const isOtc = !LISTED.some((x) => exch.includes(x)); // blank or "OTC" -> true
+  const isOtc = !LISTED.some((x) => exch.includes(x));
 
   const rel = String(issuer.relationshipsToIssuer ?? "").toLowerCase();
   const isControl = CONTROL_WORDS.some((w) => rel.includes(w));
@@ -129,11 +161,11 @@ export function evaluate(fd: any, accession: string): Target {
   const highValueBasis = HIGH_VALUE_BASIS.some((k) => basisText.includes(k));
 
   let score = 0;
-  if (isOtc) score += 50; // primary gate
-  if (highValueBasis) score += 25; // debt / convert / PIPE holder
-  if (isControl) score += 15; // permanent volume cap
-  if (slicePct != null && slicePct < 1) score += 10; // forced to dribble
-  score += Math.min(amv / 100_000, 20); // size, capped
+  if (isOtc) score += 50;
+  if (highValueBasis) score += 25;
+  if (isControl) score += 15;
+  if (slicePct != null && slicePct < 1) score += 10;
+  score += Math.min(amv / 100_000, 20);
 
   return {
     issuer: String(issuer.issuerName ?? ""),
@@ -156,7 +188,7 @@ export function evaluate(fd: any, accession: string): Target {
   };
 }
 
-/** Bounded-concurrency map, to respect SEC's ~10 req/sec ceiling. */
+/** Bounded-concurrency map; the rate gate keeps total throughput under SEC's ceiling. */
 export async function mapPool<T, R>(
   items: T[],
   concurrency: number,
